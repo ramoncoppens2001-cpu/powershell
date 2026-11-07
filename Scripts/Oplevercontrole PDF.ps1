@@ -58,6 +58,54 @@ param(
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 $ErrorActionPreference = "Stop"
 
+# --------------------------------------------------------------------------
+# Voortgang. De PowerShell-runner toont dit als blauwe balk met percentage;
+# los gedraaid zie je de gewone voortgangsbalk van PowerShell. Hooguit vijf
+# keer per seconde bijwerken: bij tienduizenden bestanden kost elke melding
+# anders merkbaar tijd.
+# --------------------------------------------------------------------------
+$script:voortgangKlok = [System.Diagnostics.Stopwatch]::StartNew()
+$script:voortgangEerste = $true
+
+function Meld-Voortgang {
+    <# Totaal 0 = nog onbekend: dan alleen een teller, zonder percentage. #>
+    param([string]$Wat, [long]$Nu, [long]$Totaal = 0, [string]$Status = "", [string]$Detail = "")
+    $laatste = $Totaal -gt 0 -and $Nu -ge $Totaal
+    if (-not ($script:voortgangEerste -or $laatste) -and
+        $script:voortgangKlok.ElapsedMilliseconds -lt 200) { return }
+    $script:voortgangEerste = $false
+    $script:voortgangKlok.Restart()
+    if (-not $Status) {
+        $Status = if ($Totaal -gt 0) { "{0:N0} van {1:N0}" -f $Nu, $Totaal } else { "{0:N0} gevonden" -f $Nu }
+    }
+    $melding = @{ Activity = $Wat; Status = $Status }
+    if ($Detail) { $melding.CurrentOperation = $Detail }
+    if ($Totaal -gt 0) { $melding.PercentComplete = [Math]::Min(100, [int][Math]::Floor($Nu * 100.0 / $Totaal)) }
+    Write-Progress @melding
+}
+
+function Stop-Voortgang {
+    param([string]$Wat)
+    $script:voortgangEerste = $true
+    Write-Progress -Activity $Wat -Completed
+}
+
+function Tel-Onderweg {
+    <# Telt mee terwijl Get-ChildItem nog leest; geeft alles ongewijzigd door.
+       Verwacht > 0 geeft een percentage, als het aantal ongeveer bekend is. #>
+    param([Parameter(ValueFromPipeline)]$Item, [string]$Wat, [long]$Verwacht = 0)
+    begin { $n = 0 }
+    process {
+        $n++
+        if ($Verwacht -gt 0) {
+            Meld-Voortgang -Wat $Wat -Nu ([Math]::Min($n, $Verwacht - 1)) -Totaal $Verwacht `
+                -Status ("{0:N0} gevonden" -f $n)
+        }
+        else { Meld-Voortgang -Wat $Wat -Nu $n }
+        $Item
+    }
+}
+
 if (-not (Test-Path -LiteralPath $Modelmap -PathType Container)) {
     Write-Host "Modelmap bestaat niet: $Modelmap" -ForegroundColor Red
     exit 1
@@ -183,8 +231,10 @@ if ($AlleenBovensteMap) {
 }
 else {
     $modellen = @(Get-ChildItem -LiteralPath $Modelmap -Include $Filter -File -Recurse `
-            -ErrorAction SilentlyContinue | Where-Object { -not $_.Name.StartsWith('~$') })
+            -ErrorAction SilentlyContinue | Tel-Onderweg -Wat "Werkmappen zoeken" |
+            Where-Object { -not $_.Name.StartsWith('~$') })
 }
+Stop-Voortgang -Wat "Werkmappen zoeken"
 
 if ($modellen.Count -eq 0) {
     Write-Host "Geen werkmappen gevonden die aan het filter voldoen." -ForegroundColor Yellow
@@ -200,6 +250,7 @@ $geteld = 0
 
 foreach ($model in $modellen) {
     $geteld++
+    Meld-Voortgang -Wat "Werkmappen controleren" -Nu $geteld -Totaal $modellen.Count -Detail $model.Name
     if ($geteld % 50 -eq 0) { Write-Host "  $geteld van $($modellen.Count)..." }
 
     $relatief = $model.FullName.Substring($modelBasislengte)
@@ -259,6 +310,7 @@ foreach ($model in $modellen) {
     $rij.Toelichting = $bezwaren -join "; "
     $resultaten.Add([pscustomobject]$rij)
 }
+Stop-Voortgang -Wat "Werkmappen controleren"
 
 # PDF's zonder werkmap
 $alleWeesPdfs = New-Object System.Collections.Generic.List[object]

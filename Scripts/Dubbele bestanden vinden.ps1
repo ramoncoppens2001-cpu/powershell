@@ -48,6 +48,54 @@ param(
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 $ErrorActionPreference = "Stop"
 
+# --------------------------------------------------------------------------
+# Voortgang. De PowerShell-runner toont dit als blauwe balk met percentage;
+# los gedraaid zie je de gewone voortgangsbalk van PowerShell. Hooguit vijf
+# keer per seconde bijwerken: bij tienduizenden bestanden kost elke melding
+# anders merkbaar tijd.
+# --------------------------------------------------------------------------
+$script:voortgangKlok = [System.Diagnostics.Stopwatch]::StartNew()
+$script:voortgangEerste = $true
+
+function Meld-Voortgang {
+    <# Totaal 0 = nog onbekend: dan alleen een teller, zonder percentage. #>
+    param([string]$Wat, [long]$Nu, [long]$Totaal = 0, [string]$Status = "", [string]$Detail = "")
+    $laatste = $Totaal -gt 0 -and $Nu -ge $Totaal
+    if (-not ($script:voortgangEerste -or $laatste) -and
+        $script:voortgangKlok.ElapsedMilliseconds -lt 200) { return }
+    $script:voortgangEerste = $false
+    $script:voortgangKlok.Restart()
+    if (-not $Status) {
+        $Status = if ($Totaal -gt 0) { "{0:N0} van {1:N0}" -f $Nu, $Totaal } else { "{0:N0} gevonden" -f $Nu }
+    }
+    $melding = @{ Activity = $Wat; Status = $Status }
+    if ($Detail) { $melding.CurrentOperation = $Detail }
+    if ($Totaal -gt 0) { $melding.PercentComplete = [Math]::Min(100, [int][Math]::Floor($Nu * 100.0 / $Totaal)) }
+    Write-Progress @melding
+}
+
+function Stop-Voortgang {
+    param([string]$Wat)
+    $script:voortgangEerste = $true
+    Write-Progress -Activity $Wat -Completed
+}
+
+function Tel-Onderweg {
+    <# Telt mee terwijl Get-ChildItem nog leest; geeft alles ongewijzigd door.
+       Verwacht > 0 geeft een percentage, als het aantal ongeveer bekend is. #>
+    param([Parameter(ValueFromPipeline)]$Item, [string]$Wat, [long]$Verwacht = 0)
+    begin { $n = 0 }
+    process {
+        $n++
+        if ($Verwacht -gt 0) {
+            Meld-Voortgang -Wat $Wat -Nu ([Math]::Min($n, $Verwacht - 1)) -Totaal $Verwacht `
+                -Status ("{0:N0} gevonden" -f $n)
+        }
+        else { Meld-Voortgang -Wat $Wat -Nu $n }
+        $Item
+    }
+}
+
 if (-not (Test-Path -LiteralPath $Map -PathType Container)) {
     Write-Host "Map bestaat niet: $Map" -ForegroundColor Red
     exit 1
@@ -129,7 +177,7 @@ function Lees-Map {
     $lengte = $Basis.TrimEnd('\').Length + 1
     $uit = New-Object System.Collections.Generic.List[object]
     foreach ($b in (Get-ChildItem -LiteralPath $Basis -Include $Filter -File -Recurse `
-                -ErrorAction SilentlyContinue)) {
+                -ErrorAction SilentlyContinue | Tel-Onderweg -Wat "Bestanden zoeken in $Label")) {
         if ($b.Length -lt $drempel) { continue }
         if ($b.Name.StartsWith('~$')) { continue }
         $uit.Add([pscustomobject]@{
@@ -155,6 +203,7 @@ foreach ($b in (Lees-Map -Basis $Map -Label $labelA)) { $bestanden.Add($b) }
 if ($TweedeMap) {
     foreach ($b in (Lees-Map -Basis $TweedeMap -Label $labelB)) { $bestanden.Add($b) }
 }
+Stop-Voortgang -Wat "Bestanden zoeken"
 
 Write-Host "$($bestanden.Count) bestanden boven de drempel."
 
@@ -184,9 +233,15 @@ Write-Host ""
 Write-Host "Inhoud lezen en vergelijken..."
 $geteld = 0
 $mislukt = New-Object System.Collections.Generic.List[object]
+# Voortgang op bytes, niet op aantal: één bestand van 2 GB duurt langer dan
+# duizend van 20 kB, en dan zou de balk lang stilstaan op 99%.
+$teLezenBytes = [long](($teHashen | Measure-Object -Property Bytes -Sum).Sum)
+$gelezenBytes = [long]0
 
 foreach ($b in $teHashen) {
     $geteld++
+    Meld-Voortgang -Wat "Inhoud vergelijken" -Nu $gelezenBytes -Totaal ([Math]::Max(1, $teLezenBytes)) `
+        -Status ("{0:N0} van {1:N0} bestanden" -f $geteld, $teHashen.Count) -Detail $b.Relatief
     if ($geteld % 100 -eq 0) {
         Write-Host "  $geteld van $($teHashen.Count)..."
     }
@@ -196,7 +251,9 @@ foreach ($b in $teHashen) {
     catch {
         $mislukt.Add([pscustomobject]@{ Pad = $b.Vol; Fout = $_.Exception.Message })
     }
+    $gelezenBytes += $b.Bytes
 }
+Stop-Voortgang -Wat "Inhoud vergelijken"
 
 if ($mislukt.Count -gt 0) {
     Write-Host "$($mislukt.Count) bestanden konden niet gelezen worden (vergrendeld of geen rechten)." `

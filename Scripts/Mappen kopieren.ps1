@@ -45,6 +45,54 @@ param(
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 $ErrorActionPreference = "Stop"
 
+# --------------------------------------------------------------------------
+# Voortgang. De PowerShell-runner toont dit als blauwe balk met percentage;
+# los gedraaid zie je de gewone voortgangsbalk van PowerShell. Hooguit vijf
+# keer per seconde bijwerken: bij tienduizenden bestanden kost elke melding
+# anders merkbaar tijd.
+# --------------------------------------------------------------------------
+$script:voortgangKlok = [System.Diagnostics.Stopwatch]::StartNew()
+$script:voortgangEerste = $true
+
+function Meld-Voortgang {
+    <# Totaal 0 = nog onbekend: dan alleen een teller, zonder percentage. #>
+    param([string]$Wat, [long]$Nu, [long]$Totaal = 0, [string]$Status = "", [string]$Detail = "")
+    $laatste = $Totaal -gt 0 -and $Nu -ge $Totaal
+    if (-not ($script:voortgangEerste -or $laatste) -and
+        $script:voortgangKlok.ElapsedMilliseconds -lt 200) { return }
+    $script:voortgangEerste = $false
+    $script:voortgangKlok.Restart()
+    if (-not $Status) {
+        $Status = if ($Totaal -gt 0) { "{0:N0} van {1:N0}" -f $Nu, $Totaal } else { "{0:N0} gevonden" -f $Nu }
+    }
+    $melding = @{ Activity = $Wat; Status = $Status }
+    if ($Detail) { $melding.CurrentOperation = $Detail }
+    if ($Totaal -gt 0) { $melding.PercentComplete = [Math]::Min(100, [int][Math]::Floor($Nu * 100.0 / $Totaal)) }
+    Write-Progress @melding
+}
+
+function Stop-Voortgang {
+    param([string]$Wat)
+    $script:voortgangEerste = $true
+    Write-Progress -Activity $Wat -Completed
+}
+
+function Tel-Onderweg {
+    <# Telt mee terwijl Get-ChildItem nog leest; geeft alles ongewijzigd door.
+       Verwacht > 0 geeft een percentage, als het aantal ongeveer bekend is. #>
+    param([Parameter(ValueFromPipeline)]$Item, [string]$Wat, [long]$Verwacht = 0)
+    begin { $n = 0 }
+    process {
+        $n++
+        if ($Verwacht -gt 0) {
+            Meld-Voortgang -Wat $Wat -Nu ([Math]::Min($n, $Verwacht - 1)) -Totaal $Verwacht `
+                -Status ("{0:N0} gevonden" -f $n)
+        }
+        else { Meld-Voortgang -Wat $Wat -Nu $n }
+        $Item
+    }
+}
+
 if (-not (Test-Path -LiteralPath $Bronmap -PathType Container)) {
     Write-Host "Bronmap bestaat niet: $Bronmap" -ForegroundColor Red
     exit 1
@@ -74,10 +122,18 @@ Write-Host ""
 $gekopieerd = 0
 $overgeslagenMappen = 0
 $fouten = 0
+$Nummers = @($Nummers)
+$mapNr = 0
+# Voortgang in duizendsten per map, zodat PerBestand binnen een map kan
+# doorlopen. Robocopy meldt niets tussendoor; daar springt de balk per map.
+$stappen = [long]$Nummers.Count * 1000
 
 foreach ($naam in $Nummers) {
+    $mapNr++
     $bron = Join-Path $Bronmap $naam
     $doel = Join-Path $Doelmap $naam
+    Meld-Voortgang -Wat "Mappen kopiëren" -Nu (($mapNr - 1) * 1000) -Totaal $stappen `
+        -Status "map $mapNr van $($Nummers.Count): $naam"
 
     if (-not (Test-Path -LiteralPath $bron -PathType Container)) {
         Write-Host "BRON NIET GEVONDEN, overgeslagen: $bron" -ForegroundColor Yellow
@@ -114,10 +170,16 @@ foreach ($naam in $Nummers) {
 
     # ---- PerBestand ----
     $lengte = $bron.TrimEnd('\').Length + 1
-    $bestanden = Get-ChildItem -LiteralPath $bron -Recurse -File -ErrorAction SilentlyContinue
+    $bestanden = @(Get-ChildItem -LiteralPath $bron -Recurse -File -ErrorAction SilentlyContinue)
     $inDezeMap = 0
+    $bestandNr = 0
 
     foreach ($bestand in $bestanden) {
+        $bestandNr++
+        Meld-Voortgang -Wat "Mappen kopiëren" `
+            -Nu (($mapNr - 1) * 1000 + [long][Math]::Floor($bestandNr * 1000.0 / $bestanden.Count)) `
+            -Totaal $stappen -Detail $bestand.Name `
+            -Status "map $mapNr van $($Nummers.Count): $naam · bestand $bestandNr van $($bestanden.Count)"
         $relatief = $bestand.FullName.Substring($lengte)
         $doelpad = Join-Path $doel $relatief
         $doelmapVanBestand = Split-Path -Parent $doelpad
@@ -159,6 +221,7 @@ foreach ($naam in $Nummers) {
     Write-Host "  $inDezeMap bestanden gekopieerd"
     $gekopieerd++
 }
+Stop-Voortgang -Wat "Mappen kopiëren"
 
 Write-Host ""
 Write-Host "Klaar. $gekopieerd mappen verwerkt, $overgeslagenMappen niet gevonden, $fouten fouten." `

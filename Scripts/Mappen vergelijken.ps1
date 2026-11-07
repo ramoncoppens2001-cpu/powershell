@@ -46,6 +46,54 @@ param(
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 $ErrorActionPreference = "Stop"
 
+# --------------------------------------------------------------------------
+# Voortgang. De PowerShell-runner toont dit als blauwe balk met percentage;
+# los gedraaid zie je de gewone voortgangsbalk van PowerShell. Hooguit vijf
+# keer per seconde bijwerken: bij tienduizenden bestanden kost elke melding
+# anders merkbaar tijd.
+# --------------------------------------------------------------------------
+$script:voortgangKlok = [System.Diagnostics.Stopwatch]::StartNew()
+$script:voortgangEerste = $true
+
+function Meld-Voortgang {
+    <# Totaal 0 = nog onbekend: dan alleen een teller, zonder percentage. #>
+    param([string]$Wat, [long]$Nu, [long]$Totaal = 0, [string]$Status = "", [string]$Detail = "")
+    $laatste = $Totaal -gt 0 -and $Nu -ge $Totaal
+    if (-not ($script:voortgangEerste -or $laatste) -and
+        $script:voortgangKlok.ElapsedMilliseconds -lt 200) { return }
+    $script:voortgangEerste = $false
+    $script:voortgangKlok.Restart()
+    if (-not $Status) {
+        $Status = if ($Totaal -gt 0) { "{0:N0} van {1:N0}" -f $Nu, $Totaal } else { "{0:N0} gevonden" -f $Nu }
+    }
+    $melding = @{ Activity = $Wat; Status = $Status }
+    if ($Detail) { $melding.CurrentOperation = $Detail }
+    if ($Totaal -gt 0) { $melding.PercentComplete = [Math]::Min(100, [int][Math]::Floor($Nu * 100.0 / $Totaal)) }
+    Write-Progress @melding
+}
+
+function Stop-Voortgang {
+    param([string]$Wat)
+    $script:voortgangEerste = $true
+    Write-Progress -Activity $Wat -Completed
+}
+
+function Tel-Onderweg {
+    <# Telt mee terwijl Get-ChildItem nog leest; geeft alles ongewijzigd door.
+       Verwacht > 0 geeft een percentage, als het aantal ongeveer bekend is. #>
+    param([Parameter(ValueFromPipeline)]$Item, [string]$Wat, [long]$Verwacht = 0)
+    begin { $n = 0 }
+    process {
+        $n++
+        if ($Verwacht -gt 0) {
+            Meld-Voortgang -Wat $Wat -Nu ([Math]::Min($n, $Verwacht - 1)) -Totaal $Verwacht `
+                -Status ("{0:N0} gevonden" -f $n)
+        }
+        else { Meld-Voortgang -Wat $Wat -Nu $n }
+        $Item
+    }
+}
+
 foreach ($paar in @(@{n = "MapA"; p = $MapA }, @{n = "MapB"; p = $MapB })) {
     if (-not (Test-Path -LiteralPath $paar.p -PathType Container)) {
         Write-Host "$($paar.n) bestaat niet: $($paar.p)" -ForegroundColor Red
@@ -144,11 +192,16 @@ function Bepaal-Rapportpad {
 }
 
 function Lees-Boom {
-    param([string]$Basis)
+    <# Verwacht: ongeveer hoeveel bestanden er zijn (0 = geen idee). Bij map B
+       is dat het aantal van map A, want twee mappen die je vergelijkt lijken
+       meestal op elkaar; dan geeft de balk een redelijk percentage. #>
+    param([string]$Basis, [string]$Wat, [long]$Verwacht = 0)
     $lengte = $Basis.TrimEnd('\').Length + 1
     $tabel = @{}
     Get-ChildItem -LiteralPath $Basis -Recurse -File -ErrorAction SilentlyContinue |
+        Tel-Onderweg -Wat $Wat -Verwacht $Verwacht |
         ForEach-Object { $tabel[$_.FullName.Substring($lengte)] = $_ }
+    Stop-Voortgang -Wat $Wat
     return $tabel
 }
 
@@ -245,8 +298,8 @@ Write-Host "$LabelA : $MapA"
 Write-Host "$LabelB : $MapB"
 Write-Host "Inlezen..."
 
-$a = Lees-Boom -Basis $MapA
-$b = Lees-Boom -Basis $MapB
+$a = Lees-Boom -Basis $MapA -Wat "$LabelA lezen (1 van 2)"
+$b = Lees-Boom -Basis $MapB -Wat "$LabelB lezen (2 van 2)" -Verwacht $a.Count
 
 Write-Host "$($a.Count) bestanden in $LabelA, $($b.Count) in $LabelB."
 Write-Host ""
